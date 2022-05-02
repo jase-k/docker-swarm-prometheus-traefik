@@ -1,21 +1,48 @@
-version: '3.7'
+version: "3.7"
 
 services:
+  dockersocket:
+    image: tecnativa/docker-socket-proxy
+    privileged: true
+    networks:
+      - "traefik"
+      - "inbound"
+      - "inverseproxy_shared"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      CONTAINERS: 1
+      NETWORKS: 1
+      SERVICES: 1
+      SWARM: 1
+      TASKS: 1
+    restart: unless-stopped
   traefik:
-    image: traefik:v2.0.4
+    image: traefik:v2.6
     command:
       - "--log.level=DEBUG"
       - "--api.insecure=true"
       - "--metrics.prometheus=true"
       - "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0"
       - "--providers.docker=true"
+      - "--providers.docker.endpoint=http://dockersocket:2375"
       - "--providers.docker.swarmmode=true"
       - "--providers.docker.watch"
+      # - "--entrypoints.web.address=:80"
+      # - "--entrypoints.web.http.redirections.entrypoint.to=web-main"
+      # - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web-main.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      #- "--certificatesresolvers.letsencrypt.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory"
+      # Read: https://docs.traefik.io/https/acme/
+      - "--certificatesresolvers.letsencrypt.acme.email=it@lulzbot.com"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json" # Where the acme file will be located to use let's encrypt
     networks:
       - traefik
       - inbound
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./letsencrypt/:letsencrypt
     ports:
       - target: 80
         published: 80
@@ -37,30 +64,175 @@ services:
         delay: 10s
       restart_policy:
         condition: on-failure
+
+  mongodb:
+    image: mongo:3
+    restart: always
+    volumes:
+      - mongodb:/data/db
+    networks:
+      - inverseproxy_shared
+    deploy:
+      placement:
+        constraints:
+          - node.role==manager
+      restart_policy:
+        condition: on-failure
+
+  locomotive:
+    image: quay.io/akretion/locomotive-shopinvader:v4.0.x-20200706
+    env_file:
+      - .docker/locomotive.env
+    environment:
+      - RAILS_ENV=development
+      - STORE_ASSET_IN_S3=false
+      - DRAGON_FLY_SECRET=thisISaDEMOkeyNOTsecret
+      - MONGODB_DEV_HOST=mongodb
+      - LOCOMOTIVE_ADMIN_SSL_REDIRECT=true
+      - LOCOMOTIVE_ENABLE_REGISTRATION=true
+    volumes:
+      - usr_src_app_log:/usr/src/app/tmp
+      - usr_src_app_tmp:/usr/src/app/log
+      - usr_src_app_public_sites:/usr/src/app/public/sites
+      - usr_src_app_public_uploaded:/usr/src/app/public/uploaded_assets
+      # - ./public/500.html:/usr/src/app/public/500.html
+      # - ./public/Lulzbot_Logo_R_RGB.svg:/usr/src/app/public/Lulzbot_Logo_R_RGB.svg
+    depends_on:
+      - mongodb
+      - elastic
+    ports:
+      - "3000:3000"
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        # - "traefik.locomotive.frontend.rule=Host(`f3d-locomotive.localhost`)"
+        # - "traefik.www.frontend.rule=Host(`f3d-locomotive.localhost`)"
+        # - "traefik.forbid-crawlers.frontend: "Host:${DOMAIN_SITE};PathPrefix:/locomotive,/locomotive/{anything:.*}"
+        - "traefik.port=3000"
+        # - "traefik.frontend.passHostHeader=true"
+        - "traefik.http.routers.locomotive.rule=Host(`f3d-locomotive.localhost`)"
+        - "traefik.http.routers.locomotive.entrypoints=web-main"
+        - "traefik.http.routers.locomotive.service=locomotive"
+        - "traefik.http.routers.locomotive.tls=true"
+        - "traefik.http.routers.locomotive.tls.certresolver=letsencrypt"
+        - "traefik.http.services.locomotive.loadbalancer.server.port=3000"
+        - "traefik.http.routers.site.entrypoints=web-main"
+        - "traefik.http.routers.site.rule=Host(`f3d-shop.localhost`)"
+        - "traefik.http.routers.site.service=site"
+        - "traefik.http.routers.site.tls=true"
+        - "traefik.http.routers.site.tls.certresolver=letsencrypt"
+        - "traefik.http.services.site.loadbalancer.server.port=3000"
+        # - "traefik.http.routers.locomotive.middlewares=test-compress"
+        # - "traefik.http.middlewares.test-compress.compress=true"
+      # placement:
+      # constraints:
+      #   - node.role==manager
+      restart_policy:
+        condition: on-failure
+    tty: true
+    networks:
+      - inverseproxy_shared
+      - inbound
+
+  elastic:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.10.1
+    ports:
+      - "9200:9200"
+    environment:
+      discovery.type: single-node
+      http.cors.enabled: "true"
+      http.cors.allow-origin: "*"
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "false" #traefik handles SSL
+      xpack.security.authc.api_key.enabled: "true"
+      xpack.security.authc.anonymous.roles: "public"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.www.frontend.rule=Host(`f3d-elastic.localhost`)"
+        - "traefik.http.routers.elastic.entrypoints=web-main"
+        - "traefik.http.routers.elastic.rule=Host(`f3d-elastic.localhost`)"
+        - "traefik.http.routers.elastic.service=elastic"
+        # - "traefik.http.routers.elastic.tls=true"
+        # - "traefik.http.routers.elastic.tls.certresolver=letsencrypt"
+        - "traefik.http.services.elastic.loadbalancer.server.port=9200"
+      placement:
+        constraints:
+          - node.role==manager
+      restart_policy:
+        condition: on-failure
+    networks:
+      - inverseproxy_shared
+      - inbound
+  elasticsearch_exporter:
+    image: quay.io/prometheuscommunity/elasticsearch-exporter:latest
+    command:
+      - "--es.uri=http://localhost:9200"
+    ports:
+      - "9114:9114"
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        # - "traefik.http.routers.elastic.tls=true"
+        # - "traefik.http.routers.elastic.tls.certresolver=letsencrypt"
+        - "traefik.http.services.elastic.loadbalancer.server.port=9114"
+      placement:
+        constraints:
+          - node.role==manager
+      restart_policy:
+        condition: on-failure
+    networks:
+      - inbound
+
+  custom-api:
+    image: lulzbotit/fame-custom-api:1.0.8
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.custom-api.entrypoints=web-main"
+        - "traefik.www.frontend.rule=Host(`f3d-api.localhost`)"
+        - "traefik.http.routers.custom-api.rule=Host(`f3d-api.localhost`)"
+        - "traefik.http.routers.custom-api.service=custom-api"
+        # - "traefik.http.routers.custom-api.tls=true"
+        # - "traefik.http.routers.custom-api.tls.certresolver=letsencrypt"
+        - "traefik.http.services.custom-api.loadbalancer.server.port=8001"
+      placement:
+        constraints:
+          - node.role==manager
+      restart_policy:
+        condition: on-failure
+    networks:
+      inverseproxy_shared:
+      default:
+        aliases:
+          - custom-api
+
   prometheus:
     image: prom/prometheus
     volumes:
       - ./prometheus/:/etc/prometheus/
       - prometheus_data:/prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
     networks:
       - inbound
     deploy:
       labels:
-       - "traefik.http.routers.prometheus.rule=Host(`prometheus.localhost`)"
-       - "traefik.http.routers.prometheus.service=prometheus"
-       - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
-       - "traefik.docker.network=inbound"
+        - "traefik.http.routers.prometheus.rule=Host(`prometheus.localhost`)"
+        - "traefik.http.routers.prometheus.service=prometheus"
+        - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+        - "traefik.docker.network=inbound"
       placement:
         constraints:
-        - node.role==manager
+          - node.role==manager
       restart_policy:
         condition: on-failure
-  
+
   grafana:
     image: grafana/grafana
     depends_on:
@@ -92,7 +264,16 @@ networks:
   inbound:
     driver: overlay
     name: inbound
+  inverseproxy_shared:
+    driver: overlay
+    name: inverseproxy_shared
 
 volumes:
-    prometheus_data: {}
-    grafana_data: {}
+  prometheus_data: {}
+  grafana_data: {}
+  mongodb:
+  esdata:
+  usr_src_app_log:
+  usr_src_app_tmp:
+  usr_src_app_public_sites:
+  usr_src_app_public_uploaded:
